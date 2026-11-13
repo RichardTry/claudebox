@@ -486,7 +486,7 @@ inside the container to work.
 
 ClaudeBox creates a per-project Debian-based Docker image with:
 - Node.js (via NVM for version flexibility)
-- Claude Code CLI (@anthropic-ai/claude-code)
+- Claude Code CLI (native binary, downloaded from downloads.claude.ai)
 - User account matching host UID/GID
 - Network firewall (project-specific allowlists)
 - Volume mounts for workspace and configuration
