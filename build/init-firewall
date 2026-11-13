@@ -18,7 +18,94 @@ allow_clipboard_bridge() {
     done <<< "$addresses"
 }
 
+# Open the project domain allowlist for direct (non-proxied) access.
+# Used when no proxy is configured, or with CLAUDEBOX_PROXY_STRICT=false.
+allow_direct_domains() {
+    # Default allowed domains
+    DEFAULT_DOMAINS="api.anthropic.com console.anthropic.com statsig.anthropic.com sentry.io"
+
+    ALLOWED_DOMAINS="$DEFAULT_DOMAINS"
+    ALLOWLIST_FILE="/home/DOCKERUSER/.claudebox/allowlist"
+    if [ -f "$ALLOWLIST_FILE" ]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^#.* ]] && continue
+            [[ -z "$line" ]] && continue
+            domain="${line#\*.}"
+            domain="$(echo "$domain" | xargs)"
+            [[ -n "$domain" ]] && ALLOWED_DOMAINS="$ALLOWED_DOMAINS $domain"
+        done < "$ALLOWLIST_FILE"
+    fi
+
+    if command -v ipset >/dev/null 2>&1; then
+        ipset destroy allowed-domains 2>/dev/null || true
+        ipset create allowed-domains hash:net
+        ipset destroy allowed-ips 2>/dev/null || true
+        ipset create allowed-ips hash:net
+
+        for domain in $ALLOWED_DOMAINS; do
+            if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+                ipset add allowed-ips $domain 2>/dev/null || true
+            else
+                ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u) || ips=""
+                for ip in $ips; do
+                    ipset add allowed-domains $ip 2>/dev/null || true
+                done
+            fi
+        done
+        iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+        iptables -A OUTPUT -m set --match-set allowed-ips dst -j ACCEPT
+    else
+        for domain in $ALLOWED_DOMAINS; do
+            if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+                iptables -A OUTPUT -d $domain -j ACCEPT
+            else
+                ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u) || ips=""
+                for ip in $ips; do
+                    iptables -A OUTPUT -d $ip -j ACCEPT
+                done
+            fi
+        done
+    fi
+}
+
+# Allow TCP to the configured proxy only. Fails closed (non-zero) when the
+# proxy URL is malformed or its address cannot be resolved.
+allow_proxy_only() {
+    local url="${CLAUDEBOX_PROXY_URL:-}"
+    local hostport host port ips ip
+    hostport="${url#*://}"
+    hostport="${hostport%%/*}"
+    hostport="${hostport##*@}"
+    if [[ "$hostport" == \[*\]:* ]]; then
+        host="${hostport#[}"; host="${host%]:*}"
+        port="${hostport##*]:}"
+    else
+        host="${hostport%:*}"
+        port="${hostport##*:}"
+    fi
+    if [[ -z "$host" ]] || [[ ! "$port" =~ ^[0-9]+$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+        printf 'Invalid CLAUDEBOX_PROXY_URL: %s\n' "$url" >&2
+        return 1
+    fi
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ips="$host"
+    else
+        ips=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u) || ips=""
+    fi
+    if [[ -z "$ips" ]]; then
+        printf 'Cannot resolve proxy host %s; refusing to allow any egress\n' "$host" >&2
+        return 1
+    fi
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        iptables -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
+    done <<< "$ips"
+}
+
 if [ "${DISABLE_FIREWALL:-false}" = "true" ]; then
+    if [ -n "${CLAUDEBOX_PROXY_URL:-}" ]; then
+        printf 'WARNING: --disable-firewall turns off the proxy killswitch; container traffic is unrestricted.\n' >&2
+    fi
     rm -f "$0"
     exit 0
 fi
@@ -27,59 +114,42 @@ iptables -P OUTPUT DROP
 iptables -P INPUT DROP
 iptables -F OUTPUT 2>/dev/null || true
 iptables -F INPUT 2>/dev/null || true
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-iptables -A INPUT -p udp --sport 53 -j ACCEPT
+# External DNS is only needed for direct access. In strict proxy mode names are
+# resolved by the proxy, so no DNS allowance is opened at all: Docker's
+# embedded resolver, where used, lives inside the container netns and is
+# covered by the loopback rule below.
+if [ -z "${CLAUDEBOX_PROXY_URL:-}" ] || [ "${CLAUDEBOX_PROXY_STRICT:-true}" != "true" ]; then
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+    iptables -A INPUT -p udp --sport 53 -j ACCEPT
+fi
 iptables -A OUTPUT -o lo -j ACCEPT
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -s 127.0.0.0/8 -d 127.0.0.0/8 -j ACCEPT
 iptables -A INPUT -s 127.0.0.0/8 -d 127.0.0.0/8 -j ACCEPT
 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-# Default allowed domains
-DEFAULT_DOMAINS="api.anthropic.com console.anthropic.com statsig.anthropic.com sentry.io"
 
-ALLOWED_DOMAINS="$DEFAULT_DOMAINS"
-ALLOWLIST_FILE="/home/DOCKERUSER/.claudebox/allowlist"
-if [ -f "$ALLOWLIST_FILE" ]; then
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#.* ]] && continue
-        [[ -z "$line" ]] && continue
-        domain="${line#\*.}"
-        domain="$(echo "$domain" | xargs)"
-        [[ -n "$domain" ]] && ALLOWED_DOMAINS="$ALLOWED_DOMAINS $domain"
-    done < "$ALLOWLIST_FILE"
+# IPv6 is not proxied, so keep it closed instead of unfiltered.
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -P OUTPUT DROP 2>/dev/null || true
+    ip6tables -P INPUT DROP 2>/dev/null || true
+    ip6tables -F OUTPUT 2>/dev/null || true
+    ip6tables -F INPUT 2>/dev/null || true
+    ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 fi
 
-if command -v ipset >/dev/null 2>&1; then
-    ipset destroy allowed-domains 2>/dev/null || true
-    ipset create allowed-domains hash:net
-    ipset destroy allowed-ips 2>/dev/null || true
-    ipset create allowed-ips hash:net
-
-    for domain in $ALLOWED_DOMAINS; do
-        if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-            ipset add allowed-ips $domain 2>/dev/null || true
-        else
-            ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u) || ips=""
-            for ip in $ips; do
-                ipset add allowed-domains $ip 2>/dev/null || true
-            done
-        fi
-    done
-    iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
-    iptables -A OUTPUT -m set --match-set allowed-ips dst -j ACCEPT
+if [ -n "${CLAUDEBOX_PROXY_URL:-}" ]; then
+    allow_proxy_only
+    if [ "${CLAUDEBOX_PROXY_STRICT:-true}" != "true" ]; then
+        allow_direct_domains
+    fi
 else
-    for domain in $ALLOWED_DOMAINS; do
-        if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-            iptables -A OUTPUT -d $domain -j ACCEPT
-        else
-            ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u) || ips=""
-            for ip in $ips; do
-                iptables -A OUTPUT -d $ip -j ACCEPT
-            done
-        fi
-    done
+    allow_direct_domains
 fi
+
 allow_clipboard_bridge
 rm -f "$(realpath "$0")"

@@ -18,6 +18,30 @@ export CLAUDEBOX_HOME="${HOME}/.claudebox"
 readonly NODE_VERSION="--lts"
 readonly DELTA_VERSION="0.17.0"
 
+# Optional upstream proxy for container egress.
+# When set, init-firewall allows only this proxy address and drops everything
+# else (killswitch): no proxy -> no network, never a direct fallback.
+# Can be set via environment or by putting the URL on the first line of
+# ~/.claudebox/proxy. Example: http://172.39.1.5:2081
+if [[ -z "${CLAUDEBOX_PROXY_URL:-}" && -r "${HOME}/.claudebox/proxy" ]]; then
+    while IFS= read -r _claudebox_proxy_line; do
+        [[ "$_claudebox_proxy_line" =~ ^[[:space:]]*(#|$) ]] && continue
+        CLAUDEBOX_PROXY_URL="$(echo "$_claudebox_proxy_line" | xargs)"
+        break
+    done < "${HOME}/.claudebox/proxy"
+    unset _claudebox_proxy_line
+fi
+# Explicit opt-out: CLAUDEBOX_PROXY_URL=none/off restores direct access.
+case "${CLAUDEBOX_PROXY_URL:-}" in
+    none|off|no|disabled) CLAUDEBOX_PROXY_URL="" ;;
+esac
+readonly CLAUDEBOX_PROXY_URL="${CLAUDEBOX_PROXY_URL:-}"
+# "true" (default) = only the proxy is reachable. "false" additionally keeps
+# the domain allowlist open so listed hosts can still be reached directly.
+readonly CLAUDEBOX_PROXY_STRICT="${CLAUDEBOX_PROXY_STRICT:-true}"
+export CLAUDEBOX_PROXY_URL
+export CLAUDEBOX_PROXY_STRICT
+
 # Script path resolution - moved to main claudebox.sh since it needs BASH_SOURCE
 # SCRIPT_PATH will be set by main script
 

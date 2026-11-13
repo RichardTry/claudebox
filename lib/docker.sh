@@ -431,6 +431,21 @@ run_claudebox_container() (
         slot_index=$(get_slot_index "$slot_name" "$PROJECT_PARENT_DIR" 2>/dev/null || echo "1")
     fi
     
+    # Route all container egress through the upstream proxy. The matching
+    # firewall (init-firewall) only permits the proxy address, so a dead proxy
+    # means no network at all - never a direct fallback.
+    if [[ -n "${CLAUDEBOX_PROXY_URL:-}" ]]; then
+        docker_args+=(
+            --add-host "host.docker.internal:host-gateway"
+            -e "HTTP_PROXY=$CLAUDEBOX_PROXY_URL"
+            -e "HTTPS_PROXY=$CLAUDEBOX_PROXY_URL"
+            -e "ALL_PROXY=$CLAUDEBOX_PROXY_URL"
+            -e "NO_PROXY=localhost,127.0.0.1,::1"
+            -e "CLAUDEBOX_PROXY_URL=$CLAUDEBOX_PROXY_URL"
+            -e "CLAUDEBOX_PROXY_STRICT=${CLAUDEBOX_PROXY_STRICT:-true}"
+        )
+    fi
+
     if [[ -n "${ANTHROPIC_API_KEY+x}" ]]; then
         docker_args+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
     fi

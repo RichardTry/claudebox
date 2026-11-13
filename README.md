@@ -391,6 +391,40 @@ claudebox --disable-firewall
 claudebox --dangerously-skip-permissions
 ```
 
+### Proxy / Killswitch
+
+ClaudeBox can force all container egress through an upstream proxy. When a proxy
+is configured, the in-container firewall allows **only** that proxy address and
+drops everything else — if the proxy is down, the container has no network at
+all, with no direct fallback.
+
+```bash
+# one-off
+CLAUDEBOX_PROXY_URL=http://172.39.1.5:2081 claudebox
+
+# persistent (first non-comment line of the file is used)
+echo 'http://172.39.1.5:2081' > ~/.claudebox/proxy
+```
+
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are set inside the container, so
+tools that honour them (claude, npm, pip/uv, git, curl) go through the proxy;
+tools that ignore them are blocked by the firewall rather than leaking.
+
+The proxy must listen on an address reachable from the container — typically the
+Docker bridge gateway (e.g. `172.39.1.5`), not the host's `127.0.0.1`, which
+inside the container points at the container itself. ClaudeBox adds
+`host.docker.internal` via `--add-host` on Linux, so
+`http://host.docker.internal:2081` also works.
+
+Notes:
+
+- The proxy host is resolved when the container starts; if it cannot be
+  resolved, the session refuses to start instead of opening the network.
+- `CLAUDEBOX_PROXY_STRICT=false` additionally keeps the project domain
+  allowlist open for direct access.
+- `--disable-firewall` disables the killswitch as well.
+- IPv6 is closed while a proxy is configured.
+
 ### Maintenance
 
 ```bash
